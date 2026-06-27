@@ -26,9 +26,10 @@ The Proxmox host runs bare-metal and manages LXC containers. Key host-level conf
 **LXC containers:**
 | CT ID | Name | IP |
 |---|---|---|
-| 100 | Pi-hole 
-| 101 | Docker / Portainer 
-| 102 | Budget App 
+| 100 | Pi-hole | 192.168.86.100 |
+| 101 | Docker / Portainer | 192.168.86.101 |
+| 102 | Budget App | 192.168.86.102 |
+| 103 | Home Assistant | 192.168.86.103 |
 
 ---
 
@@ -341,12 +342,148 @@ docker compose up -d api
 
 ---
 
+## CT 103 — Home Assistant
+
+Receives webhook POSTs from the washer/dryer sensor (ESP32-C3 + MPU6050) and triggers automations (phone notifications, etc.).
+
+### LXC Setup (on Proxmox host)
+
+Home Assistant runs as **Home Assistant Container** (Docker) inside a dedicated unprivileged LXC.
+
+```bash
+# 1. Create the LXC — Debian 12, 2 cores, 2GB RAM, 8GB disk
+pct create 103 /var/lib/vz/template/cache/<debian-12-template>.tar.zst \
+  --hostname homeassistant \
+  --cores 2 \
+  --memory 2048 \
+  --net0 name=eth0,bridge=vmbr0,ip=192.168.86.103/24,gw=192.168.86.1 \
+  --storage local-lvm \
+  --rootfs local-lvm:8 \
+  --unprivileged 1 \
+  --features nesting=1
+
+pct start 103
+pct enter 103
+```
+
+```bash
+# 2. Inside CT 103 — install Docker
+apt update && apt install -y curl
+curl -fsSL https://get.docker.com | sh
+
+# 3. Create config directory
+mkdir -p /opt/homeassistant/config
+
+# 4. Run Home Assistant Container
+docker run -d \
+  --name homeassistant \
+  --restart unless-stopped \
+  --network host \
+  -e TZ=America/Denver \
+  -v /opt/homeassistant/config:/config \
+  ghcr.io/home-assistant/home-assistant:stable
+```
+
+Home Assistant UI will be available at `http://192.168.86.103:8123` after first-run setup (~60 seconds).
+
+### Washer Webhook Configuration
+
+After completing onboarding in the HA UI:
+
+1. Go to **Settings → Automations → Create Automation → Start with an empty automation**
+2. Add trigger: **Webhook** — set Webhook ID to `washer_started`
+3. Add action: **Send notification** (or any action you want)
+4. Save. Repeat for a second automation with Webhook ID `washer_done`.
+
+Alternatively, add this to `configuration.yaml` in `/opt/homeassistant/config/`:
+
+```yaml
+automation:
+  - alias: "Washer Started"
+    trigger:
+      - platform: webhook
+        webhook_id: washer_started
+    action:
+      - service: notify.mobile_app_<your_phone>
+        data:
+          message: "Washer is running."
+
+  - alias: "Washer Done"
+    trigger:
+      - platform: webhook
+        webhook_id: washer_done
+    action:
+      - service: notify.mobile_app_<your_phone>
+        data:
+          message: "Washer is done!"
+```
+
+Restart HA after editing `configuration.yaml`: **Developer Tools → Restart**.
+
+The full webhook URLs the ESP32 hits:
+```
+POST http://192.168.86.103:8123/api/webhook/washer_started
+POST http://192.168.86.103:8123/api/webhook/washer_done
+```
+
+### Useful Commands
+
+```bash
+docker logs homeassistant -f          # live logs
+docker restart homeassistant          # restart HA
+docker pull ghcr.io/home-assistant/home-assistant:stable && docker restart homeassistant  # update
+```
+
+---
+
+## Washer/Dryer Sensor
+
+An ESP32-C3 (Seeed XIAO) + MPU6050 vibration sensor that detects when the washing machine is running and POSTs webhooks to Home Assistant.
+
+**Firmware:** `washer-sensor/sens_light_up.ino`
+
+### Hardware
+
+| Component | Details |
+|---|---|
+| Microcontroller | Seeed Studio XIAO ESP32-C3 |
+| Accelerometer | MPU6050 (I2C) — SDA: GPIO6, SCL: GPIO7 |
+| Power | USB-C wired |
+| Mounting | Magnets on washer side panel |
+
+**Before flashing**, fill in the three constants at the top of `sens_light_up.ino`:
+
+```cpp
+const char* SSID      = "YOUR_WIFI_SSID";
+const char* WIFI_PASS = "YOUR_WIFI_PASSWORD";
+const char* HA_HOST   = "http://192.168.86.103:8123";
+```
+
+### How It Works
+
+- Reads X/Y/Z acceleration every 50ms and diffs against the previous reading
+- If any axis changes by more than `THRESHOLD` (default `0.3g`), counts as a shake
+- **5 consecutive seconds of shaking** → fires `washer_started` webhook, state = WASHING
+- **60 consecutive seconds of quiet** while WASHING → fires `washer_done` webhook, state = IDLE
+
+### Tuning
+
+```cpp
+const float THRESHOLD = 0.3;          // g-force delta per tick — raise if false triggers, lower if it misses gentle cycles
+const int SHAKE_CONFIRM_TICKS = 100;  // 100 ticks × 50ms = 5s to confirm STARTED
+const int QUIET_CONFIRM_TICKS = 1200; // 1200 ticks × 50ms = 60s to confirm DONE
+```
+
+**Calibration note:** The MPU6050 runs `calcOffsets()` on boot — sensor must be still. If the washer is already running when the device powers on, re-seat the sensor and reboot.
+
+---
+
 ## Pending / Remaining Phases
 
 - **Phase 9:** Proxmox backup jobs
 - **Phase 10:** Tailscale VPN + Pi-hole on mobile
 - **Phase 11:** Telegram bot for Proxmox host monitoring
-- **DHCP reservations** for `.100` and `.101` (via Google Home app / router)
+- **DHCP reservations** for all LXC IPs (via Google Home app / router)
 - **Media storage expansion** — NVMe will fill fast, need a large HDD
 
 ---
@@ -359,6 +496,7 @@ docker compose up -d api
 192.168.86.100  — CT 100: Pi-hole (DNS)
 192.168.86.101  — CT 101: Docker (Portainer :9443, Rockflix :3000, Radarr :7878, Sonarr :8989, qBittorrent :8080, Prowlarr :9696, Uptime Kuma :3001, Cloudflared)
 192.168.86.102  — CT 102: Budget App (Express+React :3001, Postgres :5432)
+192.168.86.103  — CT 103: Home Assistant (:8123) — washer/dryer webhook target
 
 Public: watch.aidenswanson.com  → Cloudflare tunnel → CT 101:3000
         budget.aidenswanson.com → Cloudflare tunnel → CT 102:3001
