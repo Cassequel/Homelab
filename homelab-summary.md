@@ -1,0 +1,366 @@
+# HomeLab — Full Reference Summary
+
+## Hardware
+
+**Machine:** Dell Optiplex (repurposed)
+- CPU: Intel Core i7-7700
+- RAM: 16 GB
+- Storage: 476.9 GB NVMe SSD (single drive — OS, containers, and media all share this)
+- OS: Proxmox VE 9.2.2 (no-subscription repo enabled)
+- Static IP: `192.168.86.31`
+
+---
+
+## Proxmox Host Configuration
+
+The Proxmox host runs bare-metal and manages LXC containers. Key host-level config:
+
+**Media storage directories on host:**
+```
+/mnt/media/Movies
+/mnt/media/TV Shows
+/mnt/media/Downloads
+```
+
+**No-subscription repo** enabled via `/etc/apt/sources.list.d/pve-no-subscription.list`.
+
+**LXC containers:**
+| CT ID | Name | IP |
+|---|---|---|
+| 100 | Pi-hole | 192.168.86.100 |
+| 101 | Docker / Portainer | 192.168.86.101 |
+| 102 | Budget App | 192.168.86.102 |
+
+---
+
+## CT 100 — Pi-hole
+
+Network-wide DNS ad blocker. Runs as an LXC container, listens on `192.168.86.100`. All devices on the `192.168.86.x` subnet are pointed at it for DNS.
+
+---
+
+## CT 102 — Budget App
+
+Personal budgeting web app. Runs as a **single Node.js process** (Express serves both API and built React client) with a local Postgres database. Intentionally NOT Docker — native Node + systemd, separate from CT 101's Docker stacks.
+
+- **Repo:** `Cassequel/Budget` (private), cloned to `/opt/budget`
+- **Service:** `/etc/systemd/system/budget.service` — runs `node server/dist/index.js` as the `budget` system user
+- **Port:** `3001`
+- **Public URL:** `budget.aidenswanson.com` — added as a second hostname on CT 101's existing Cloudflare tunnel (dashboard-managed), routing to `192.168.86.102:3001`
+- **Database:** PostgreSQL (local to CT 102), role `budget`, database `budget`. `DATABASE_SSL=false` (LAN only). Schema managed via Drizzle Kit migrations (`npm run db:migrate --workspace=server`)
+- **`.env`** at `/opt/budget/.env` (gitignored) — holds `DATABASE_URL`, `JWT_SECRET`, `ADMIN_PASSWORD`, `ENCRYPTION_KEY`, `PLAID_CLIENT_ID`, `PLAID_SECRET`, `PLAID_ENV=production`, `PLAID_WEBHOOK_URL`, `CLIENT_URL`, `ANTHROPIC_API_KEY`
+- ⚠️ **Never rotate `ENCRYPTION_KEY`** after accounts are linked — it decrypts stored Plaid access tokens. Re-linking is the only recovery.
+
+### Stack
+
+| Layer | Tech |
+|---|---|
+| Server | Node.js 20, Express, TypeScript, Drizzle ORM + `pg` |
+| Client | React 19, TypeScript, Vite, TailwindCSS 4, Recharts |
+| Database | PostgreSQL 16 (local) |
+| Auth | Single-user JWT (`ADMIN_PASSWORD` env var) |
+
+### Key Features
+
+- **Plaid** (production) — bank + Venmo connections via Plaid Link. Access tokens stored AES-256-encrypted. Webhook at `https://budget.aidenswanson.com/api/plaid/webhook`
+- **Auto-categorization** — hybrid: deterministic map from Plaid's `personal_finance_category.primary` for obvious cases; ambiguous ones batched to `claude-haiku-4-5` via `@anthropic-ai/sdk`. Runs after every Plaid sync + manual button. Only touches `NULL` category rows (never overwrites manual edits)
+- **Dashboard** — net worth, monthly spend/income, runway, monthly spending trend line chart (filterable by category)
+- **Breakdown** — month-by-month spend-by-category bar chart + transaction list (clickable bars filter the list). Excludes Loan Payments & Transfers from all aggregates
+- **Transactions** — full list with account source badges (Venmo/MACU/Amex), category filter chips, per-category totals, inline category editing
+- **Budget** — category cards with monthly limits, progress bars, inline editing (name/limit/color), 17 default categories seeded at boot
+- **Plans & Savings** — financial planning + savings goal tracking
+
+### Update Workflow
+
+```bash
+# On dev machine
+git push
+
+# On CT 102
+cd /opt/budget && git pull && bash deploy/deploy.sh && sudo systemctl restart budget
+```
+
+`deploy.sh` runs: `npm install` → `npm run build` (server + client) → `npm run db:migrate` → done.
+
+**Troubleshooting:**
+- `journalctl -u budget -f` — app logs
+- If `git pull` fails with "dubious ownership": `git config --global --add safe.directory /opt/budget`
+- If `git pull` fails with local changes: `git checkout -- package-lock.json` (npm install regenerates it)
+
+---
+
+## CT 101 — Docker / Portainer
+
+Main workhorse container. Runs all Docker stacks via Portainer (accessible at `https://192.168.86.101:9443`).
+
+### TUN Device Passthrough (required for Gluetun VPN)
+
+Added to `/etc/pve/lxc/101.conf` on the Proxmox host:
+```
+lxc.cgroup2.devices.allow: c 10:200 rwm
+lxc.mount.entry: /dev/net/tun dev/net/tun none bind,create=file
+```
+
+### Media Bind Mount into CT 101
+
+Run on Proxmox host:
+```bash
+pct set 101 -mp0 /mnt/media,mp=/mnt/media
+```
+
+### Permissions Fix
+
+Because CT 101 is an unprivileged container, UIDs are shifted by 100000. Run on the Proxmox host (not inside the LXC):
+```bash
+chown -R 101000:101000 /mnt/media/Movies
+chown -R 101000:101000 /mnt/media/"TV Shows"
+chown -R 101000:101000 /mnt/media/Downloads
+```
+
+---
+
+## Docker Stack 1 — Media Pipeline (`/opt/media-pipeline`)
+
+Handles torrent downloading, indexing, and library management — all routed through a VPN.
+
+| Container | Port | Purpose |
+|---|---|---|
+| **Gluetun** | — | ProtonVPN OpenVPN kill switch. `FIREWALL_INPUT_PORTS=8080` to allow qBittorrent traffic through |
+| **qBittorrent** | 8080 | Torrent client. Uses `network_mode: service:gluetun` — all traffic through VPN |
+| **Radarr** | 7878 | Movie library manager. Root folder: `/movies` → `/mnt/media/Movies` on host |
+| **Sonarr** | 8989 | TV show library manager. Root folder: `/tv` → `/mnt/media/TV Shows` on host |
+| **Prowlarr** | 9696 | Indexer aggregator. Feeds Radarr + Sonarr. Indexers: YTS, EZTV, 1337x |
+| **Watchtower** | — | Auto-updates all running containers |
+| **Uptime Kuma** | 3001 | Service uptime monitoring dashboard |
+| **Cloudflared** | — | Cloudflare tunnel — exposes Rockflix at `watch.aidenswanson.com` |
+
+**Gluetun credentials** are stored as Portainer environment variables (not in compose files).
+
+**qBittorrent config** is persisted in a named Docker volume:
+`media-pipeline_qbittorrent-config`
+
+**Download client wiring:** Both Radarr and Sonarr point to qBittorrent at `http://localhost:8080` (reachable because they share the Gluetun network namespace via `network_mode`).
+
+---
+
+## Docker Stack 2 — Rockflix (`/opt/rockflix`)
+
+Custom Netflix-style media server. Source: private GitHub repo, cloned to `/opt/rockflix` on CT 101.
+
+### Containers
+
+| Container | Image | Port | Notes |
+|---|---|---|---|
+| **db** | `postgres:16` | internal | Named volume `postgres_data`. DB name: `rockflix` |
+| **api** | Custom (.NET 10) | 5244 (internal) | Built from `./Rockflix.API`. Includes ffmpeg |
+| **client** | Custom (nginx + React 19) | `3000:80` | Built from `./rockflix-client` |
+
+All three share a `rockflix-net` Docker bridge network.
+
+### Compose Configuration
+
+```yaml
+services:
+  db:
+    image: postgres:16
+    environment:
+      POSTGRES_DB: rockflix
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: ${DB_PASSWORD}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+
+  api:
+    build: ./Rockflix.API
+    environment:
+      ConnectionStrings__DefaultConnection: "Host=db;Port=5432;..."
+      ASPNETCORE_URLS: "http://+:5244"
+      Media__RootPath: "/mnt/media"
+      Jwt__Secret / Issuer / Audience: ...
+      Tmdb__ApiKey: ...
+      Radarr__BaseUrl: "http://192.168.86.101:7878"
+      Sonarr__BaseUrl: "http://192.168.86.101:8989"
+      Telegram__BotToken / InviteCode: ...
+      Anthropic__ApiKey: ...
+      Radarr__RootFolderPath: "/movies"
+      Sonarr__RootFolderPath: "/tv"
+    volumes:
+      - /mnt/media:/mnt/media
+
+  client:
+    build: ./rockflix-client
+    ports:
+      - "3000:80"
+```
+
+### `.env` file on CT 101 (gitignored)
+
+```
+DB_PASSWORD=
+JWT_SECRET=
+TMDB_API_KEY=
+RADARR_API_KEY=
+SONARR_API_KEY=
+TELEGRAM_BOT_TOKEN=
+TELEGRAM_INVITE_CODE=iamrockhard
+ANTHROPIC_API_KEY=
+RADARR_QUALITY_PROFILE_ID=
+SONARR_QUALITY_PROFILE_ID=
+```
+
+---
+
+## Rockflix — Application Architecture
+
+### API (Rockflix.API — .NET 10)
+
+**Dockerfile:**
+- Build stage: `mcr.microsoft.com/dotnet/sdk:10.0` → `dotnet publish -c Release`
+- Runtime stage: `mcr.microsoft.com/dotnet/aspnet:10.0` + `ffmpeg` installed via apt
+
+**Controllers:**
+- `AuthController` — register/login, JWT issuance
+- `MoviesController` — movie library CRUD
+- `TvShowsController` — TV show + episode library
+- `MediaController` — general media endpoints
+- `StreamController` — video streaming with range request support
+- `RequestController` — media request management
+- `TelegramController` / `WebhookController` — Telegram bot webhook handling
+- `FavoritesController` — user favorites
+- `WatchHistoryController` — playback progress tracking
+- `AdminController` — admin-only operations
+- `SmsController` — SMS-related features
+
+**Services:**
+- `MediaScannerService` — scans `/mnt/media` and populates the DB with discovered movies/shows
+- `TmdbService` — fetches metadata (posters, descriptions, ratings) from TMDB API
+- `TokenService` — JWT generation and validation
+- `MediaRequestService` — uses **Claude Haiku** (`claude-haiku-4-5-20251001`) to parse natural language requests from Telegram, then calls Radarr/Sonarr APIs to queue downloads
+
+**Database (EF Core + PostgreSQL 16):**
+
+Tables managed via EF Core migrations:
+- `Users` — app accounts (Email, Username, TelegramChatId unique indexes)
+- `Movies` — scanned movie library
+- `TvShows` + `Episodes` — scanned TV library
+- `WatchHistory` — per-user playback progress (unique per user+movie and user+episode)
+- `Favorites` — saved favorites per user
+- `TelegramUsers` — authorized Telegram users (join code: `iamrockhard`)
+- `TelegramRequests` — messages/requests from Telegram
+- `MediaRequests` — structured download requests
+
+Key `OnModelCreating` configuration:
+- `TelegramRequest.ChatId` → FK to `TelegramUser.ChatId` (not UserId — prevents phantom column crash)
+- Unique partial indexes on WatchHistory to allow upsert on progress
+
+**Migrations timeline:**
+- `20260405` — InitialCreate
+- `20260420` — AddFavorites
+- `20260520` — AddTelegramUsers
+- `20260604` — AddMediaRequests
+
+### Client (rockflix-client — React 19 + Vite)
+
+**Dockerfile:** Node 20 Alpine build → nginx:alpine runtime. Vite builds to `/dist`, served from `/usr/share/nginx/html`.
+
+**Pages:**
+- `LoginPage` / `RegisterPage` — auth
+- `HomePage` — main library browse
+- `MovieDetailPage` — movie info + request/play
+- `TvShowPage` — season/episode browser
+- `PlayerPage` — video player
+- `FavoritesPage` — saved favorites
+- `TelegramUsersPage` — admin view of authorized Telegram users
+
+**Routing:** React Router DOM
+
+**Auth:** `AuthContext.jsx` — JWT stored in memory/context, passed via Authorization header
+
+**API layer:** `src/services/api.js` — centralized Axios/fetch wrapper
+
+### nginx (Client Container)
+
+```nginx
+location / {
+    root /usr/share/nginx/html;
+    try_files $uri $uri/ /index.html;  # SPA routing
+}
+
+location /api {
+    proxy_pass http://api:5244;
+    proxy_buffering off;               # Video streaming
+    proxy_read_timeout 3600s;
+    proxy_set_header Range $http_range;
+    proxy_force_ranges on;             # Seeking support
+}
+```
+
+---
+
+## Public Access — Cloudflare Tunnel
+
+Single dashboard-managed tunnel running in the Cloudflared container on CT 101 (`media-pipeline` stack). No ports exposed to the public internet — all traffic goes through Cloudflare's edge.
+
+| Hostname | Routes to | Purpose |
+|---|---|---|
+| `watch.aidenswanson.com` | `http://localhost:3000` (CT 101) | Rockflix media server |
+| `budget.aidenswanson.com` | `http://192.168.86.102:3001` (CT 102) | Budget app |
+
+**Telegram webhook:** `https://watch.aidenswanson.com/api/telegram`
+**Plaid webhook:** `https://budget.aidenswanson.com/api/plaid/webhook`
+
+To add more hostnames: Zero Trust dashboard → Networks → Tunnels → open the tunnel → Public Hostname → Add.
+
+---
+
+## Telegram Bot
+
+- Users join by messaging the bot with the invite code (`iamrockhard`)
+- Once authorized, users can send natural language requests ("add Inception", "download Breaking Bad season 2")
+- `MediaRequestService` passes the message to Claude Haiku, which parses intent and media title, then calls Radarr or Sonarr accordingly
+- Webhook receives updates at `/api/telegram`
+
+---
+
+## Update Workflow
+
+To deploy code changes to CT 101:
+
+```bash
+# 1. On dev machine — push to GitHub
+git push
+
+# 2. SSH into CT 101
+ssh aiden@192.168.86.101
+
+# 3. Pull and rebuild
+cd /opt/rockflix
+git pull
+docker compose build api --no-cache
+docker compose up -d api
+```
+
+---
+
+## Pending / Remaining Phases
+
+- **Phase 9:** Proxmox backup jobs
+- **Phase 10:** Tailscale VPN + Pi-hole on mobile
+- **Phase 11:** Telegram bot for Proxmox host monitoring
+- **DHCP reservations** for `.100` and `.101` (via Google Home app / router)
+- **Media storage expansion** — NVMe will fill fast, need a large HDD
+
+---
+
+## Network Map
+
+```
+192.168.86.1    — Router / gateway
+192.168.86.31   — Proxmox host
+192.168.86.100  — CT 100: Pi-hole (DNS)
+192.168.86.101  — CT 101: Docker (Portainer :9443, Rockflix :3000, Radarr :7878, Sonarr :8989, qBittorrent :8080, Prowlarr :9696, Uptime Kuma :3001, Cloudflared)
+192.168.86.102  — CT 102: Budget App (Express+React :3001, Postgres :5432)
+
+Public: watch.aidenswanson.com  → Cloudflare tunnel → CT 101:3000
+        budget.aidenswanson.com → Cloudflare tunnel → CT 102:3001
+```
