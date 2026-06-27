@@ -7,7 +7,6 @@
 - RAM: 16 GB
 - Storage: 476.9 GB NVMe SSD (single drive — OS, containers, and media all share this)
 - OS: Proxmox VE 9.2.2 (no-subscription repo enabled)
-- Static IP: `192.168.86.31`
 
 ---
 
@@ -27,9 +26,9 @@ The Proxmox host runs bare-metal and manages LXC containers. Key host-level conf
 **LXC containers:**
 | CT ID | Name | IP |
 |---|---|---|
-| 100 | Pi-hole | 192.168.86.100 |
-| 101 | Docker / Portainer | 192.168.86.101 |
-| 102 | Budget App | 192.168.86.102 |
+| 100 | Pi-hole 
+| 101 | Docker / Portainer 
+| 102 | Budget App 
 
 ---
 
@@ -46,7 +45,7 @@ Personal budgeting web app. Runs as a **single Node.js process** (Express serves
 - **Repo:** `Cassequel/Budget` (private), cloned to `/opt/budget`
 - **Service:** `/etc/systemd/system/budget.service` — runs `node server/dist/index.js` as the `budget` system user
 - **Port:** `3001`
-- **Public URL:** `budget.aidenswanson.com` — added as a second hostname on CT 101's existing Cloudflare tunnel (dashboard-managed), routing to `192.168.86.102:3001`
+- **Public URL:** `budget.aidenswanson.com` — added as a second hostname on CT 101's existing Cloudflare tunnel (dashboard-managed)
 - **Database:** PostgreSQL (local to CT 102), role `budget`, database `budget`. `DATABASE_SSL=false` (LAN only). Schema managed via Drizzle Kit migrations (`npm run db:migrate --workspace=server`)
 - **`.env`** at `/opt/budget/.env` (gitignored) — holds `DATABASE_URL`, `JWT_SECRET`, `ADMIN_PASSWORD`, `ENCRYPTION_KEY`, `PLAID_CLIENT_ID`, `PLAID_SECRET`, `PLAID_ENV=production`, `PLAID_WEBHOOK_URL`, `CLIENT_URL`, `ANTHROPIC_API_KEY`
 - ⚠️ **Never rotate `ENCRYPTION_KEY`** after accounts are linked — it decrypts stored Plaid access tokens. Re-linking is the only recovery.
