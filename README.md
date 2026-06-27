@@ -440,8 +440,6 @@ docker pull ghcr.io/home-assistant/home-assistant:stable && docker restart homea
 
 An ESP32-C3 (Seeed XIAO) + MPU6050 vibration sensor that detects when the washing machine is running and POSTs webhooks to Home Assistant.
 
-**Firmware:** `washer-sensor/sens_light_up.ino`
-
 ### Hardware
 
 | Component | Details |
