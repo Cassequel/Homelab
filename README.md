@@ -29,7 +29,11 @@ The Proxmox host runs bare-metal and manages LXC containers. Key host-level conf
 | 100 | Pi-hole | 192.168.86.100 |
 | 101 | Docker / Portainer | 192.168.86.101 |
 | 102 | Budget App | 192.168.86.102 |
-| 103 | Home Assistant | 192.168.86.103 |
+
+**VMs:**
+| VM ID | Name | IP |
+|---|---|---|
+| 103 | Home Assistant (HAOS) | 192.168.86.103 |
 
 ---
 
@@ -342,49 +346,29 @@ docker compose up -d api
 
 ---
 
-## CT 103 — Home Assistant
+## VM 103 — Home Assistant
 
 Receives webhook POSTs from the washer/dryer sensor (ESP32-C3 + MPU6050) and triggers automations (phone notifications, etc.).
 
-### LXC Setup (on Proxmox host)
+Runs as **Home Assistant OS (HAOS)** in a Proxmox VM — not an LXC. HAOS is a purpose-built Linux OS that includes the Supervisor and Add-on Store. It needs a full VM (not LXC) because it runs its own kernel.
 
-Home Assistant runs as **Home Assistant Container** (Docker) inside a dedicated unprivileged LXC.
+### VM Setup (on Proxmox host)
 
-```bash
-# 1. Create the LXC — Debian 12, 2 cores, 2GB RAM, 8GB disk
-pct create 103 /var/lib/vz/template/cache/<debian-12-template>.tar.zst \
-  --hostname homeassistant \
-  --cores 2 \
-  --memory 2048 \
-  --net0 name=eth0,bridge=vmbr0,ip=192.168.86.103/24,gw=192.168.86.1 \
-  --storage local-lvm \
-  --rootfs local-lvm:8 \
-  --unprivileged 1 \
-  --features nesting=1
-
-pct start 103
-pct enter 103
-```
+Installed via the community helper script:
 
 ```bash
-# 2. Inside CT 103 — install Docker
-apt update && apt install -y curl
-curl -fsSL https://get.docker.com | sh
-
-# 3. Create config directory
-mkdir -p /opt/homeassistant/config
-
-# 4. Run Home Assistant Container
-docker run -d \
-  --name homeassistant \
-  --restart unless-stopped \
-  --network host \
-  -e TZ=America/Denver \
-  -v /opt/homeassistant/config:/config \
-  ghcr.io/home-assistant/home-assistant:stable
+bash -c "$(curl -fsSL https://raw.githubusercontent.com/community-scripts/ProxmoxVE/main/vm/haos-vm.sh)"
 ```
 
-Home Assistant UI will be available at `http://192.168.86.103:8123` after first-run setup (~60 seconds).
+Defaults: 4GB RAM, 32GB disk, 2 vCPUs. The script downloads the official HAOS qcow2 image, creates the VM, and boots it automatically.
+
+**Static IP** — HAOS didn't pick up DHCP on first boot. Set manually from the HA console (accessible via Proxmox VM shell tab):
+
+```bash
+ha network update enp6s18 --ipv4-method static --ipv4-address 192.168.86.103/24 --ipv4-gateway 192.168.86.1 --ipv4-nameserver 192.168.86.100
+```
+
+Home Assistant UI is at `http://192.168.86.103:8123`.
 
 ### Washer Webhook Configuration
 
@@ -395,7 +379,7 @@ After completing onboarding in the HA UI:
 3. Add action: **Send notification** (or any action you want)
 4. Save. Repeat for a second automation with Webhook ID `washer_done`.
 
-Alternatively, add this to `configuration.yaml` in `/opt/homeassistant/config/`:
+Alternatively, add this to `configuration.yaml` (edit via **Settings → System → Edit configuration.yaml** in the HA UI, or via the File Editor add-on):
 
 ```yaml
 automation:
@@ -494,7 +478,7 @@ const int QUIET_CONFIRM_TICKS = 1200; // 1200 ticks × 50ms = 60s to confirm DON
 192.168.86.100  — CT 100: Pi-hole (DNS)
 192.168.86.101  — CT 101: Docker (Portainer :9443, Rockflix :3000, Radarr :7878, Sonarr :8989, qBittorrent :8080, Prowlarr :9696, Uptime Kuma :3001, Cloudflared)
 192.168.86.102  — CT 102: Budget App (Express+React :3001, Postgres :5432)
-192.168.86.103  — CT 103: Home Assistant (:8123) — washer/dryer webhook target
+192.168.86.103  — VM 103: Home Assistant OS (:8123) — washer/dryer webhook target
 
 Public: watch.aidenswanson.com  → Cloudflare tunnel → CT 101:3000
         budget.aidenswanson.com → Cloudflare tunnel → CT 102:3001
